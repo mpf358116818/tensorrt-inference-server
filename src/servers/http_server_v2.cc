@@ -322,8 +322,7 @@ class HTTPAPIServerV2 : public HTTPServerV2Impl {
 #endif  // TRTIS_ENABLE_GPU
   TRTSERVER_Error* EVBufferToInput(
       const std::string& model_name, TRTSERVER2_InferenceRequest* irequest,
-      evbuffer* input_buffer, InferRequestClass* infer_req, , int header_length);
-      const std::string& model_name, const InferRequestHeader& request_header,
+      evbuffer* input_buffer, InferRequestClass* infer_req,
       size_t header_length);
   TRTSERVER_Error* EVBufferToJson(
       rapidjson::Document* document, evbuffer_iovec* v, int* v_idx,
@@ -1124,8 +1123,7 @@ HTTPAPIServerV2::HandleServerMetadata(evhtp_request_t* req)
 }
 
 bool
-CheckBinaryInputData(
-    const rapidjson::Value& request_input, size_t* byte_size)
+CheckBinaryInputData(const rapidjson::Value& request_input, size_t* byte_size)
 {
   bool binary_input = false;
   rapidjson::Value::ConstMemberIterator itr =
@@ -1141,6 +1139,23 @@ CheckBinaryInputData(
   }
 
   return binary_input;
+}
+
+bool
+CheckBinaryOutputData(const rapidjson::Value& request_output)
+{
+  rapidjson::Value::ConstMemberIterator itr =
+      request_output.FindMember("parameters");
+  if (itr != request_output.MemberEnd()) {
+    const rapidjson::Value& params = itr->value;
+    rapidjson::Value::ConstMemberIterator iter =
+        params.FindMember("binary_data");
+    if (iter != params.MemberEnd()) {
+      return iter->value.GetBool();
+    }
+  }
+
+  return false;
 }
 
 TRTSERVER_Error*
@@ -1326,7 +1341,7 @@ HTTPAPIServerV2::EVBufferToInput(
           }
 
           RETURN_IF_ERR(TRTSERVER2_InferenceRequestAppendInputData(
-              irequest, input_name, base, byte_size, TRTSERVER_MEMORY_CPU,
+              irequest, input_name, base, base_size, TRTSERVER_MEMORY_CPU,
               0 /* memory_type_id */));
         }
 
@@ -1584,28 +1599,29 @@ HTTPAPIServerV2::InferRequestClass::InferComplete(
   rapidjson::Document::AllocatorType& allocator =
       infer_request->response_meta_data_.response_json_.GetAllocator();
   if (infer_request->FinalizeResponse(request) == EVHTP_RES_OK) {
-    // write outputs into json array
-    int i = 0;
     rapidjson::Value& response_outputs =
         infer_request->response_meta_data_.response_json_["outputs"];
+    int i = 0;
     for (auto ev_buffer : infer_request->response_meta_data_.response_buffer_) {
       rapidjson::Value& response_output = response_outputs[i++];
-      rapidjson::Value::ConstMemberIterator itr =
-          response_output.FindMember("parameters");
-      if (itr == response_output.MemberEnd()) {
-        size_t buffer_len = evbuffer_get_length(ev_buffer);
-        char json_buffer[buffer_len];
-        evbuffer_copyout(ev_buffer, &json_buffer, buffer_len);
-        WriteDataToJson(response_output, allocator, json_buffer);
+      size_t buffer_size = evbuffer_get_length(ev_buffer);
+
+      if (CheckBinaryOutputData(response_output)) {
+        // Write outputs into binary buffer
+        evbuffer_add_buffer(infer_request->req_->buffer_out, ev_buffer);
+        rapidjson::Value binary_size_val(buffer_size);
+        rapidjson::Value& params = response_output["parameters"];
+        params.AddMember("binary_data_size", binary_size_val, allocator);
       } else {
-        const rapidjson::Value& params = itr->value;
-        if (params["binary_data"].GetBool()) {
-          evbuffer_add_buffer(infer_request->req_->buffer_out, ev_buffer);
-        }
+        // Write outputs into json array
+        // Optimize write to Output Buffer
+        char json_buffer[buffer_size];
+        evbuffer_copyout(ev_buffer, &json_buffer, buffer_size);
+        WriteDataToJson(response_output, allocator, json_buffer);
       }
     }
 
-    // write json string into evbuffer
+    // write json metadata into evbuffer
     rapidjson::StringBuffer buffer;
     buffer.Clear();
     rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
